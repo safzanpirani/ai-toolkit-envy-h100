@@ -155,6 +155,7 @@ def predict_velocity(
     t: torch.Tensor,  # (B,) toolkit flow time in [0, 1] (1 = pure noise)
     llm_features: torch.Tensor,  # (B, Lt, llm_dim)
     text_mask: torch.Tensor,  # (B, Lt) 1 for real text tokens
+    seq_align: int = 1,  # pad packed seq len to a multiple of this (fp8_compute)
 ) -> torch.Tensor:
     """Run the transformer on the packed [text | image] sequence.
 
@@ -170,6 +171,26 @@ def predict_velocity(
     b, c, gh, gw = latents.shape
     num_image_tokens = gh * gw
     num_text_tokens = llm_features.shape[1]
+
+    # fp8_compute alignment: torch._scaled_mm (torchao Float8Linear) requires
+    # EVERY GEMM dimension to be divisible by 16 (MX recipes: 32) -- including
+    # the flattened batch*seq token dim, which becomes the contraction (K) dim
+    # of the backward grad-weight GEMM. Weight shapes were checked at
+    # conversion time, but the runtime token count is data-dependent: observed
+    # crash `mat1 shape (4608x4308)` where 4308 = image tokens + variable-
+    # length text tokens. All converted Linears (attention qkv/o, MLP w1/w2/w3)
+    # run over the full packed [text | image] sequence, so we pad the MASKED
+    # text region until the combined length is a multiple of ``seq_align``.
+    # Pad tokens get text_mask=0 -> indicator 0 and segment_ids=-1 below, so
+    # they are excluded from attention entirely, and the output slice keeps
+    # only the image region, so padding can never reach the loss.
+    if seq_align > 1:
+        pad = (-(num_text_tokens + num_image_tokens)) % seq_align
+        if pad:
+            llm_features = torch.nn.functional.pad(llm_features, (0, 0, 0, pad))
+            text_mask = torch.nn.functional.pad(text_mask, (0, pad))
+            num_text_tokens += pad
+
     seq_len = num_text_tokens + num_image_tokens
 
     # image latents -> tokens (row-major: h outer, w inner)
@@ -300,14 +321,20 @@ class Ideogram4Pipeline:
                 unconditional_embeds.text_embeds, device, dtype
             )
 
+        # Forward-only fp8 GEMMs don't constrain the token (M) dim, but pad
+        # anyway so sampling matches the training-time sequence layout.
+        seq_align = getattr(model, "_seq_align", 1)
+
         for t in timesteps:
             t01 = (t / 1000.0).to(device).expand(latents.shape[0])
             v_cond = predict_velocity(
-                transformer, latents.to(dtype), t01, cond_feats, cond_mask
+                transformer, latents.to(dtype), t01, cond_feats, cond_mask,
+                seq_align=seq_align,
             )
             if do_cfg:
                 v_uncond = predict_velocity(
-                    transformer, latents.to(dtype), t01, uncond_feats, uncond_mask
+                    transformer, latents.to(dtype), t01, uncond_feats, uncond_mask,
+                    seq_align=seq_align,
                 )
                 v = v_uncond + guidance_scale * (v_cond - v_uncond)
             else:

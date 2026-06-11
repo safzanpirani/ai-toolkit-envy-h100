@@ -333,6 +333,13 @@ class Ideogram4Model(BaseModel):
                 recipe=fp8_recipe,
             )
             enable_h100_fast_math()
+        # torch._scaled_mm needs every GEMM dim %16 (MX: %32), including the
+        # runtime batch*seq token dim (it is the K dim of the backward
+        # grad-weight GEMM). Weight dims are checked at conversion, but the
+        # packed [text | image] sequence length is data-dependent (observed
+        # crash: mat1 4608x4308 at step 0 backward). predict_velocity pads the
+        # masked text region to this multiple when > 1; bf16 path is untouched.
+        self._seq_align = (16 if fp8_recipe in ("tensorwise", "rowwise") else 32) if fp8_compute else 1
         flush()
 
         if (
@@ -456,6 +463,7 @@ class Ideogram4Model(BaseModel):
             t01,
             llm_features,
             text_mask,
+            seq_align=getattr(self, "_seq_align", 1),
         )
         return pred
 
