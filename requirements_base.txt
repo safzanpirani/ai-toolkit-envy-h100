@@ -1,4 +1,4 @@
-# fp8_compute (toolkit/util/fp8_compute.py) needs torchao>=0.7 float8 training; 0.10.0 verified.
+# fp8_compute (toolkit/util/fp8_compute.py): float8 training needs torchao>=0.7; the mxfp8/mxfp4 (B200) recipes use the 0.10 prototype MXLinear swap API which was removed in newer torchao - keep this pin.
 torchao==0.10.0
 safetensors
 git+https://github.com/huggingface/diffusers.git@dc8d9032171c83741fd37ed2b12bc9d8274464f3

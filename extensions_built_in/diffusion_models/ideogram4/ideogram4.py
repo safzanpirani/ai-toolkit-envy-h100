@@ -274,16 +274,24 @@ class Ideogram4Model(BaseModel):
 
         transformer = self._load_transformer(base)
 
-        # --- TRUE FP8 compute (H100/Ada) -------------------------------------
+        # --- TRUE FP8/FP4 compute (H100/Ada/B200) ----------------------------
         # model_kwargs.fp8_compute: true converts the heavy transformer Linears
-        # to torchao Float8Linear so the GEMMs themselves run on FP8 tensor
-        # cores. This is NOT the same as `quantize: true` / the ideogram fp8
-        # checkpoint, which are storage-only (weights dequantize to bf16 before
-        # every matmul). Conversion must happen here, BEFORE the LoRA network
-        # is built in BaseSDTrainProcess: LoRA monkey-patches `forward` on each
-        # target module, so it captures Float8Linear's forward as org_forward
-        # (base matmul in fp8) while its own A/B matmuls remain bf16.
+        # to torchao training linears so the GEMMs themselves run on FP8 (or,
+        # on Blackwell, MX FP8/FP4) tensor cores. This is NOT the same as
+        # `quantize: true` / the ideogram fp8 checkpoint, which are
+        # storage-only (weights dequantize to bf16 before every matmul).
+        # Conversion must happen here, BEFORE the LoRA network is built in
+        # BaseSDTrainProcess: LoRA monkey-patches `forward` on each target
+        # module, so it captures the converted forward as org_forward (base
+        # matmul in fp8/fp4) while its own A/B matmuls remain bf16.
+        #
+        # model_kwargs.fp8_compute_recipe selects the kernel recipe:
+        #   tensorwise (default) / rowwise -> torchao float8, H100+ (sm89+)
+        #   mxfp8 / mxfp4 (experimental)   -> torchao MX formats, B200 (sm100)
         fp8_compute = bool(self.model_config.model_kwargs.get("fp8_compute", False))
+        fp8_recipe = str(
+            self.model_config.model_kwargs.get("fp8_compute_recipe", "tensorwise")
+        )
         if fp8_compute and self.model_config.quantize:
             raise ValueError(
                 "model_kwargs.fp8_compute is incompatible with quantize: true "
@@ -306,9 +314,10 @@ class Ideogram4Model(BaseModel):
                 fp8_compute_available,
             )
 
-            fp8_compute_available(raise_on_unavailable=True)
+            fp8_compute_available(raise_on_unavailable=True, recipe=fp8_recipe)
             self.print_and_status_update(
-                "Converting transformer Linears to FP8 compute (torchao float8)"
+                f"Converting transformer Linears to low-precision compute "
+                f"(torchao, recipe={fp8_recipe})"
             )
             # Only the transformer-block attention + MLP projections carry the
             # FLOPs. Everything else stays bf16: input_proj / final_layer
@@ -321,6 +330,7 @@ class Ideogram4Model(BaseModel):
                     r"^layers\.\d+\.attention\.(qkv|o)$",
                     r"^layers\.\d+\.feed_forward\.(w1|w2|w3)$",
                 ],
+                recipe=fp8_recipe,
             )
             enable_h100_fast_math()
         flush()
