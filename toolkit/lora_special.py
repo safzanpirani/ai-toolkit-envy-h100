@@ -30,6 +30,10 @@ LINEAR_MODULES = [
     'Linear',
     'LoRACompatibleLinear',
     'QLinear',
+    # torchao float8 training (model_kwargs.fp8_compute). Float8Linear keeps
+    # nn.Linear's in_features/out_features/weight API, so LoRAModule wraps it
+    # transparently: org_forward runs the fp8 GEMM while LoRA A/B stay bf16.
+    'Float8Linear',
     # 'GroupNorm',
 ]
 CONV_MODULES = [

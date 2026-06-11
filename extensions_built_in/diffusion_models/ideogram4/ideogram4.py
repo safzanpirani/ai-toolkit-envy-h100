@@ -274,12 +274,55 @@ class Ideogram4Model(BaseModel):
 
         transformer = self._load_transformer(base)
 
+        # --- TRUE FP8 compute (H100/Ada) -------------------------------------
+        # model_kwargs.fp8_compute: true converts the heavy transformer Linears
+        # to torchao Float8Linear so the GEMMs themselves run on FP8 tensor
+        # cores. This is NOT the same as `quantize: true` / the ideogram fp8
+        # checkpoint, which are storage-only (weights dequantize to bf16 before
+        # every matmul). Conversion must happen here, BEFORE the LoRA network
+        # is built in BaseSDTrainProcess: LoRA monkey-patches `forward` on each
+        # target module, so it captures Float8Linear's forward as org_forward
+        # (base matmul in fp8) while its own A/B matmuls remain bf16.
+        fp8_compute = bool(self.model_config.model_kwargs.get("fp8_compute", False))
+        if fp8_compute and self.model_config.quantize:
+            raise ValueError(
+                "model_kwargs.fp8_compute is incompatible with quantize: true "
+                "(quanto QLinear and torchao Float8Linear both replace the base "
+                "Linear weights). Disable one of them; for H100 speed, use "
+                "fp8_compute with quantize: false."
+            )
+
         if self.model_config.quantize:
             self.print_and_status_update("Quantizing Transformer")
             quantize_model(self, transformer)
             flush()
         else:
             transformer.to(self.device_torch, dtype=dtype)
+
+        if fp8_compute:
+            from toolkit.util.fp8_compute import (
+                convert_to_fp8_compute,
+                enable_h100_fast_math,
+                fp8_compute_available,
+            )
+
+            fp8_compute_available(raise_on_unavailable=True)
+            self.print_and_status_update(
+                "Converting transformer Linears to FP8 compute (torchao float8)"
+            )
+            # Only the transformer-block attention + MLP projections carry the
+            # FLOPs. Everything else stays bf16: input_proj / final_layer
+            # (small + numerically sensitive), llm_cond_proj (one-shot, huge
+            # in_features), t_embedding / adaln projections (tiny, modulation-
+            # critical). The Qwen3-VL text encoder is untouched entirely.
+            convert_to_fp8_compute(
+                transformer,
+                include_patterns=[
+                    r"^layers\.\d+\.attention\.(qkv|o)$",
+                    r"^layers\.\d+\.feed_forward\.(w1|w2|w3)$",
+                ],
+            )
+            enable_h100_fast_math()
         flush()
 
         if (
